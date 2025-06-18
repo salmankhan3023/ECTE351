@@ -30,8 +30,13 @@ class DobotHandController:
         self.arduino_connected = False
         self.motor_direction = "STOP"
         self.left_hand_detected = False
+        self.right_hand_detected = False
         self.hand_in_left_zone = False
         self.hand_in_right_zone = False
+        
+        # Gesture control variables
+        self.left_hand_gesture_active = False
+        self.right_hand_gesture_active = False
         
         # Control zone parameters
         self.left_zone_width_ratio = 0.3  # 30% of screen width
@@ -54,6 +59,45 @@ class DobotHandController:
             max_num_hands=2
         )
         self.mp_drawing = mp.solutions.drawing_utils
+        
+    def check_thumb_pinky_gesture(self, hand_landmarks):
+        """
+        Check if thumb and pinky are extended while other fingers are folded
+        Returns True if the gesture is detected
+        """
+        # Landmark indices for fingertips and MCPs (base joints)
+        THUMB_TIP = 4
+        THUMB_MCP = 2
+        INDEX_TIP = 8
+        INDEX_PIP = 6
+        MIDDLE_TIP = 12
+        MIDDLE_PIP = 10
+        RING_TIP = 16
+        RING_PIP = 14
+        PINKY_TIP = 20
+        PINKY_MCP = 17
+        
+        # Get landmark positions
+        landmarks = hand_landmarks.landmark
+        
+        # Check if thumb is extended (tip higher than MCP joint)
+        thumb_extended = landmarks[THUMB_TIP].y < landmarks[THUMB_MCP].y
+        
+        # Check if pinky is extended (tip higher than MCP joint)
+        pinky_extended = landmarks[PINKY_TIP].y < landmarks[PINKY_MCP].y
+        
+        # Check if index finger is folded (tip lower than PIP joint)
+        index_folded = landmarks[INDEX_TIP].y > landmarks[INDEX_PIP].y
+        
+        # Check if middle finger is folded (tip lower than PIP joint)
+        middle_folded = landmarks[MIDDLE_TIP].y > landmarks[MIDDLE_PIP].y
+        
+        # Check if ring finger is folded (tip lower than PIP joint)
+        ring_folded = landmarks[RING_TIP].y > landmarks[RING_PIP].y
+        
+        # Return True only if thumb and pinky are extended AND other fingers are folded
+        return (thumb_extended and pinky_extended and 
+                index_folded and middle_folded and ring_folded)
         
     def find_arduino_port(self):
         try:
@@ -185,7 +229,8 @@ class DobotHandController:
             self.arduino_connected = False  # Mark as disconnected on error
             
     def process_left_hand_motor_control(self, x, img_width):
-        if not self.left_hand_detected:
+        # Only control motor if gesture is active
+        if not self.left_hand_detected or not self.left_hand_gesture_active:
             if self.motor_direction != "STOP":
                 self.send_motor_command("STOP")
             return
@@ -240,24 +285,27 @@ class DobotHandController:
         x = hand_landmarks.landmark[8].x * img_width
         y = hand_landmarks.landmark[8].y * img_height
         
-        # Check for pinch gesture
+        # Check for pinch gesture (for air pump control)
         thumb_tip = hand_landmarks.landmark[4]
         index_tip = hand_landmarks.landmark[8]
         distance = ((thumb_tip.x - index_tip.x) ** 2 + (thumb_tip.y - index_tip.y) ** 2) ** 0.5
         is_pinched = distance < 0.05
         
-        return x, y, is_pinched
+        # Check for thumb-pinky gesture
+        thumb_pinky_gesture = self.check_thumb_pinky_gesture(hand_landmarks)
+        
+        return x, y, is_pinched, thumb_pinky_gesture
         
     def map_hand_to_dobot(self, x, y, hand_label, img_width, img_height):
-        # Always update virtual coordinates even if Dobot not connected
-        if hand_label == "Right":
+        # Only update coordinates if the appropriate gesture is active
+        if hand_label == "Right" and self.right_hand_gesture_active:
             # Map right hand to X and Y axes
             self.dobot_x = 100 + ((1 - (y / img_height)) * 200)  # X: 100-300
             x_center = img_width / 2
             x_relative = x - x_center
             self.dobot_y = (x_relative / x_center) * 200  # Y: -200 to 200
             
-        elif hand_label == "Left":
+        elif hand_label == "Left" and self.left_hand_gesture_active:
             # Map left hand to Z axis (when not controlling motor)
             left_zone_width = img_width * self.left_zone_width_ratio
             if x > left_zone_width:  # Only control Z when outside motor zone
@@ -298,6 +346,16 @@ class DobotHandController:
                    (10, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.6, motor_color, 2)
         y_pos += 30
         
+        # Gesture status
+        left_gesture_color = (0, 255, 0) if self.left_hand_gesture_active else (255, 255, 255)
+        right_gesture_color = (0, 255, 0) if self.right_hand_gesture_active else (255, 255, 255)
+        cv2.putText(frame, f"Left Gesture: {'ACTIVE' if self.left_hand_gesture_active else 'INACTIVE'}", 
+                   (10, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.5, left_gesture_color, 2)
+        y_pos += 25
+        cv2.putText(frame, f"Right Gesture: {'ACTIVE' if self.right_hand_gesture_active else 'INACTIVE'}", 
+                   (10, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.5, right_gesture_color, 2)
+        y_pos += 25
+        
         # Connection status
         dobot_status = "Connected" if self.dobot_connected else "Disconnected"
         arduino_status = "Connected" if self.arduino_connected else "Disconnected"
@@ -310,8 +368,10 @@ class DobotHandController:
             img_height, img_width = frame.shape[:2]
             left_zone_width = int(img_width * self.left_zone_width_ratio)
             
-            # Zone box
-            zone_color = (0, 255, 255) if self.arduino_connected else (100, 100, 100)
+            # Zone box (green if gesture active, yellow if inactive)
+            zone_color = (0, 255, 0) if (self.arduino_connected and self.left_hand_gesture_active) else (0, 255, 255)
+            if not self.arduino_connected:
+                zone_color = (100, 100, 100)
             cv2.rectangle(frame, (0, 0), (left_zone_width, img_height), zone_color, 2)
             
             # Trigger lines
@@ -324,7 +384,7 @@ class DobotHandController:
             cv2.putText(frame, "MOTOR ZONE", (10, y_pos + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
         
         # Controls at bottom
-        cv2.putText(frame, "Right hand: X/Y control | Left hand: Z + Motor | Pinch: Pump | 'q': Quit", 
+        cv2.putText(frame, "Thumb+Pinky: Enable control | Right hand: X/Y | Left hand: Z+Motor | Pinch: Pump | 'q': Quit", 
                    (10, frame.shape[0] - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
                    
     def run(self):
@@ -336,6 +396,7 @@ class DobotHandController:
         print(f"Dobot: {'Connected' if self.dobot_connected else 'Not connected'}")
         print(f"Arduino: {'Connected' if self.arduino_connected else 'Not connected'}")
         print("Camera: Connected")
+        print("Control: Hold thumb and pinky extended to enable robot movement")
         
         if not self.dobot_connected and not self.arduino_connected:
             print("Running in demo mode - hand tracking only")
@@ -350,40 +411,60 @@ class DobotHandController:
                 rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 results = self.hands.process(rgb_frame)
                 
+                # Reset hand detection flags
                 self.left_hand_detected = False
+                self.right_hand_detected = False
+                self.left_hand_gesture_active = False
+                self.right_hand_gesture_active = False
                 
                 if results.multi_hand_landmarks:
                     for hand_landmarks, hand_handedness in zip(results.multi_hand_landmarks, results.multi_handedness):
                         hand_label = hand_handedness.classification[0].label
                         img_height, img_width, _ = frame.shape
                         
-                        x, y, is_pinched = self.process_hand_landmarks(hand_landmarks, img_width, img_height)
+                        x, y, is_pinched, thumb_pinky_gesture = self.process_hand_landmarks(
+                            hand_landmarks, img_width, img_height)
                         
                         if hand_label == "Left":
                             self.left_hand_detected = True
+                            self.left_hand_gesture_active = thumb_pinky_gesture
                             left_zone_width = img_width * self.left_zone_width_ratio
                             if x <= left_zone_width:
                                 self.process_left_hand_motor_control(x, img_width)
+                        elif hand_label == "Right":
+                            self.right_hand_detected = True
+                            self.right_hand_gesture_active = thumb_pinky_gesture
                         
-                        # Always update virtual coordinates
+                        # Only update coordinates if gesture is active
                         self.map_hand_to_dobot(x, y, hand_label, img_width, img_height)
                         
-                        # Toggle air pump on pinch
-                        if is_pinched and time.time() - self.last_command_time > 1.0:
+                        # Toggle air pump on pinch (only if gesture is active)
+                        if (is_pinched and time.time() - self.last_command_time > 1.0 and 
+                            ((hand_label == "Left" and self.left_hand_gesture_active) or
+                             (hand_label == "Right" and self.right_hand_gesture_active))):
                             self.toggle_air_pump(not self.air_pump_on)
                             self.last_command_time = time.time()
                         
                         # Draw hand landmarks
-                        self.mp_drawing.draw_landmarks(frame, hand_landmarks, self.mp_hands.HAND_CONNECTIONS)
+                        # Change color based on gesture state
+                        connection_color = (0, 255, 0) if thumb_pinky_gesture else (255, 255, 255)
+                        self.mp_drawing.draw_landmarks(
+                            frame, hand_landmarks, self.mp_hands.HAND_CONNECTIONS,
+                            landmark_drawing_spec=mp.solutions.drawing_utils.DrawingSpec(
+                                color=connection_color, thickness=2, circle_radius=2),
+                            connection_drawing_spec=mp.solutions.drawing_utils.DrawingSpec(
+                                color=connection_color, thickness=2)
+                        )
                 
-                # Stop motor if no left hand
-                if not self.left_hand_detected and self.motor_direction != "STOP":
+                # Stop motor if no left hand or gesture not active
+                if (not self.left_hand_detected or not self.left_hand_gesture_active) and self.motor_direction != "STOP":
                     self.send_motor_command("STOP")
                     self.hand_in_left_zone = False
                     self.hand_in_right_zone = False
                 
-                # Move Dobot (only if connected)
+                # Move Dobot (only if connected and gesture is active)
                 if (self.dobot_connected and self.dobot and 
+                    (self.left_hand_gesture_active or self.right_hand_gesture_active) and
                     time.time() - self.last_command_time > self.COMMAND_DELAY):
                     try:
                         self.dobot.move_to(int(self.dobot_x), int(self.dobot_y), int(self.dobot_z), self.dobot_r, wait=False)
